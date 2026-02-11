@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+bcrypt
+cryptography
+psycopg2
+openai
+faiss-cpu
+sentence-transformers
+plotly
+pandas
