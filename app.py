@@ -1,186 +1,271 @@
-# ============================
-# TAGOCP.IA - SISTEMA COMPLETO
-# ============================
+# ===============================
+# TAGOCP.IA – Plataforma de Apoio Psicológico
+# Versão Linux | Profissional | Arquivo Único
+# ===============================
 
 import streamlit as st
-import bcrypt, uuid, os, base64, re
-import psycopg2, pandas as pd
-from dotenv import load_dotenv
-from hashlib import sha256
+import sqlite3
+import bcrypt
+import jwt
+import os
+import datetime
+import base64
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+import fitz  # PyMuPDF
+import pandas as pd
+import matplotlib.pyplot as plt
 from openai import OpenAI
-import plotly.express as px
-from sentence_transformers import SentenceTransformer
-import faiss, pickle
-from datetime import datetime
 
-# ============================
-# CONFIGURAÇÕES
-# ============================
+# ===============================
+# CONFIGURAÇÕES INICIAIS
+# ===============================
+
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MASTER_KEY = os.getenv("CRYPTO_MASTER_KEY")
 
-# ============================
-# ESTILO
-# ============================
-st.set_page_config("TAGOCP.IA", layout="wide")
+APP_NAME = "tagocp.ia"
+SECRET_KEY = os.getenv("JWT_SECRET", "changeme")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+MASTER_KEY = os.getenv("MASTER_ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+client = OpenAI(api_key=OPENAI_KEY)
+fernet_master = Fernet(MASTER_KEY.encode())
+
+# ===============================
+# CSS – IDENTIDADE VISUAL
+# ===============================
+
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Gagalin&display=swap');
-html, body {
+@font-face {
+    font-family: 'Gagalin';
+    src: url('https://fonts.cdnfonts.com/css/gagalin');
+}
+html, body, [class*="css"] {
     background-color: black;
     color: #1800ad;
-    font-family: 'Gagalin', cursive;
+    font-family: 'Gagalin', sans-serif;
+}
+.stButton>button {
+    background-color: #1800ad;
+    color: white;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ============================
+# ===============================
 # BANCO DE DADOS
-# ============================
-conn = psycopg2.connect(
-    host=os.getenv("DATABASE_HOST"),
-    dbname=os.getenv("DATABASE_NAME"),
-    user=os.getenv("DATABASE_USER"),
-    password=os.getenv("DATABASE_PASSWORD"),
-    port=os.getenv("DATABASE_PORT")
-)
-cur = conn.cursor()
+# ===============================
 
-# ============================
-# CRIPTOGRAFIA
-# ============================
-def user_key(uid):
-    raw = f"{uid}{MASTER_KEY}".encode()
-    return Fernet(base64.urlsafe_b64encode(sha256(raw).digest()))
+conn = sqlite3.connect("tagocp.db", check_same_thread=False)
+cursor = conn.cursor()
 
-def encrypt(msg, uid):
-    return user_key(uid).encrypt(msg.encode()).decode()
+cursor.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE,
+    password BLOB,
+    health_focus TEXT,
+    encryption_key BLOB,
+    role TEXT
+);
 
-def decrypt(msg, uid):
-    return user_key(uid).decrypt(msg.encode()).decode()
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    content BLOB,
+    created_at TEXT
+);
+""")
+conn.commit()
 
-def hash_pass(p): return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
-def check_pass(p, h): return bcrypt.checkpw(p.encode(), h.encode())
+# ===============================
+# UTILITÁRIOS DE SEGURANÇA
+# ===============================
 
-# ============================
+def hash_password(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+def verify_password(password, hashed):
+    return bcrypt.checkpw(password.encode(), hashed)
+
+def create_user_key():
+    return Fernet.generate_key()
+
+def encrypt_user_data(user_key, text):
+    return Fernet(user_key).encrypt(text.encode())
+
+def decrypt_user_data(user_key, token):
+    return Fernet(user_key).decrypt(token).decode()
+
+def generate_jwt(user_id, role):
+    payload = {
+        "user_id": user_id,
+        "role": role,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+# ===============================
+# LGPD
+# ===============================
+
+def lgpd_term():
+    st.markdown("""
+    ### 📜 Termo LGPD
+    Esta plataforma **não substitui profissionais de saúde**.
+    Os dados são criptografados individualmente.
+    Em casos de crise, recomendamos buscar ajuda especializada.
+    """)
+
+# ===============================
 # DETECÇÃO DE CRISE
-# ============================
+# ===============================
+
 CRISIS_WORDS = [
-    "suicídio", "me matar", "morrer", "acabar com tudo",
-    "não aguento mais", "desistir da vida"
+    "quero morrer", "suicídio", "me matar",
+    "não aguento", "acabar com tudo"
 ]
 
 def detect_crisis(text):
-    for w in CRISIS_WORDS:
-        if re.search(w, text.lower()):
-            return True
+    return any(word in text.lower() for word in CRISIS_WORDS)
 
-    analysis = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL"),
-        messages=[{
-            "role": "user",
-            "content": f"Isso indica risco psicológico grave? Responda apenas SIM ou NÃO:\n{text}"
-        }],
-        temperature=0
+# ===============================
+# RAG CIENTÍFICO (SEM FAISS)
+# ===============================
+
+def load_articles():
+    texts = []
+    if not os.path.exists("articles"):
+        return texts
+
+    for file in os.listdir("articles"):
+        if file.endswith(".pdf"):
+            doc = fitz.open(os.path.join("articles", file))
+            content = "".join(page.get_text() for page in doc)
+            texts.append({"title": file, "content": content})
+    return texts
+
+def search_articles(query):
+    return [a for a in load_articles() if query.lower() in a["content"].lower()][:2]
+
+# ===============================
+# LLM
+# ===============================
+
+def generate_response(user_input):
+    articles = search_articles(user_input)
+
+    context = "\n".join(
+        f"{a['title']}:\n{a['content'][:1200]}"
+        for a in articles
     )
-
-    return "SIM" in analysis.choices[0].message.content.upper()
-
-# ============================
-# RAG FAISS
-# ============================
-try:
-    import faiss
-    FAISS_OK = True
-except Exception as e:
-    FAISS_OK = False
-    print("FAISS desativado:", e)
-def rag_context(q):
-    if not FAISS_OK:
-        return "Base científica temporariamente indisponível."
-    qv = embed.encode([q])
-    _, idx = index.search(qv, 5)
-    return "\n".join([docs[i] for i in idx[0]])
-
-
-# ============================
-# CHATBOT
-# ============================
-def chatbot_response(msg, uid):
-    crisis = detect_crisis(msg)
-    context = rag_context(msg)
-
-    if crisis:
-        return """
-⚠️ **SINAIS DE CRISE IDENTIFICADOS**
-
-Você não está sozinho.
-📞 **CVV – Centro de Valorização da Vida**
-☎️ **188 (Brasil) – 24h**
-🌐 https://www.cvv.org.br/
-"""
 
     prompt = f"""
 Você é um assistente de apoio psicológico.
-Use apenas base científica validada.
-Contexto:
+Use linguagem empática e baseada em evidências científicas.
+Não faça diagnóstico.
+
+Contexto científico:
 {context}
 
-Pergunta:
-{msg}
+Usuário:
+{user_input}
 """
 
-    r = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL"),
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
     )
+    return response.choices[0].message.content
 
-    return r.choices[0].message.content
-
-# ============================
-# DASHBOARD ADMIN
-# ============================
-def admin_panel():
-    st.header("📊 Painel Administrativo")
-
-    users = pd.read_sql("SELECT health_focus, COUNT(*) FROM users GROUP BY health_focus", conn)
-    st.plotly_chart(px.pie(users, names="health_focus", values="count"))
-
-    msgs = pd.read_sql("""
-        SELECT DATE(created_at) as d, COUNT(*) FROM messages GROUP BY d
-    """, conn)
-    st.plotly_chart(px.line(msgs, x="d", y="count"))
-
-# ============================
+# ===============================
 # INTERFACE
-# ============================
-st.image("assets/logo.png", width=160)
-st.title("TAGOCP.IA – Apoio Emocional Inteligente")
+# ===============================
 
-if "user" not in st.session_state:
+st.title("🧠 tagocp.ia")
+
+menu = st.sidebar.selectbox("Menu", ["Login", "Cadastro", "Chat", "Admin"])
+
+lgpd_term()
+
+# ===============================
+# CADASTRO
+# ===============================
+
+if menu == "Cadastro":
     email = st.text_input("Email")
     password = st.text_input("Senha", type="password")
+    focus = st.selectbox("Foco de apoio", ["Ansiedade", "Depressão", "Estresse"])
+    if st.button("Cadastrar"):
+        user_key = create_user_key()
+        cursor.execute(
+            "INSERT INTO users VALUES (NULL,?,?,?, ?, 'user')",
+            (email, hash_password(password), focus,
+             fernet_master.encrypt(user_key))
+        )
+        conn.commit()
+        st.success("Cadastro realizado")
 
+# ===============================
+# LOGIN
+# ===============================
+
+if menu == "Login":
+    email = st.text_input("Email")
+    password = st.text_input("Senha", type="password")
     if st.button("Entrar"):
-        cur.execute("SELECT id, password_hash, role FROM users WHERE email=%s", (email,))
-        u = cur.fetchone()
-        if u and check_pass(password, u[1]):
-            st.session_state.user = u[0]
-            st.session_state.role = u[2]
-            st.rerun()
-else:
-    if st.session_state.role == "admin":
-        admin_panel()
-    else:
-        msg = st.text_area("Digite como você está se sentindo")
-        if st.button("Enviar"):
-            resp = chatbot_response(msg, st.session_state.user)
-            cur.execute(
-                "INSERT INTO messages (user_id, encrypted_message, is_user) VALUES (%s,%s,%s)",
-                (st.session_state.user, encrypt(msg, st.session_state.user), True)
-            )
-            conn.commit()
-            st.markdown(resp)
+        user = cursor.execute(
+            "SELECT id,password,role,encryption_key FROM users WHERE email=?",
+            (email,)
+        ).fetchone()
+
+        if user and verify_password(password, user[1]):
+            st.session_state["user"] = {
+                "id": user[0],
+                "role": user[2],
+                "key": fernet_master.decrypt(user[3])
+            }
+            st.success("Login efetuado")
+
+# ===============================
+# CHAT
+# ===============================
+
+if menu == "Chat" and "user" in st.session_state:
+    msg = st.text_area("Como você está se sentindo?")
+    if st.button("Enviar"):
+        if detect_crisis(msg):
+            st.error("""
+🚨 **CRISE DETECTADA**
+📞 CVV – 188 (24h)
+🌐 https://www.cvv.org.br
+            """)
+        response = generate_response(msg)
+
+        encrypted = encrypt_user_data(st.session_state["user"]["key"], msg)
+        cursor.execute(
+            "INSERT INTO messages VALUES (NULL,?,?,?)",
+            (st.session_state["user"]["id"], encrypted,
+             datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+
+        st.markdown("### 💬 Resposta")
+        st.write(response)
+
+# ===============================
+# ADMIN DASHBOARD
+# ===============================
+
+if menu == "Admin" and "user" in st.session_state and st.session_state["user"]["role"] == "admin":
+    df = pd.read_sql("SELECT created_at FROM messages", conn)
+    df["created_at"] = pd.to_datetime(df["created_at"])
+    chart = df.groupby(df["created_at"].dt.date).size()
+
+    st.subheader("📊 Mensagens por dia")
+    fig, ax = plt.subplots()
+    chart.plot(ax=ax)
+    st.pyplot(fig)
+
+st.markdown("© tagocp.ia – apoio, ciência e empatia")
