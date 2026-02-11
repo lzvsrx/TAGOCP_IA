@@ -91,14 +91,19 @@ def detect_crisis(text):
 # ============================
 # RAG FAISS
 # ============================
-embed = SentenceTransformer("all-MiniLM-L6-v2")
-index = faiss.read_index("data/faiss/index.bin")
-docs = pickle.load(open("data/faiss/metadata.pkl", "rb"))
-
+try:
+    import faiss
+    FAISS_OK = True
+except Exception as e:
+    FAISS_OK = False
+    print("FAISS desativado:", e)
 def rag_context(q):
+    if not FAISS_OK:
+        return "Base científica temporariamente indisponível."
     qv = embed.encode([q])
     _, idx = index.search(qv, 5)
     return "\n".join([docs[i] for i in idx[0]])
+
 
 # ============================
 # CHATBOT
